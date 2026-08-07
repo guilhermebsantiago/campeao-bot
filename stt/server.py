@@ -13,6 +13,10 @@ model = WhisperModel(
     cpu_threads=int(os.environ.get("WHISPER_THREADS", "4")),
 )
 lock = threading.Lock()
+INITIAL_PROMPT = os.environ.get(
+    "WHISPER_PROMPT",
+    "Campeão, toca, pula, pausa, continua, para, sai, fila, rádio, letra, música.",
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -26,6 +30,7 @@ class Handler(BaseHTTPRequestHandler):
                 language="pt",
                 beam_size=1,
                 vad_filter=True,
+                initial_prompt=INITIAL_PROMPT,
             )
             text = " ".join(s.text for s in segments).strip()
         body = json.dumps({"text": text}).encode()

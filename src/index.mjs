@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
-import { Client, Events, GatewayIntentBits, Routes } from "discord.js";
+import { ActivityType, Client, Events, GatewayIntentBits, MessageFlags, Routes } from "discord.js";
 import {
   AudioPlayerStatus,
   createAudioPlayer,
@@ -38,6 +38,11 @@ const CACHE_DIR = "/data/tracks";
 const INFO_DIR = "/tmp/info";
 const CACHE_MAX_FILES = 40;
 const INFO_TTL_MS = 3 * 60 * 60 * 1000;
+const QUEUE_FILE = "/data/queue.json";
+const EMPTY_LEAVE_MS = 60000;
+const MAX_UTTERANCE_S = 12;
+const MUSIC_SILENCE_RATIO = 0.08;
+const STT_PROMPT = "Campeão, toca, pula, pausa, continua, para, sai, fila, rádio, letra, música.";
 mkdirSync(CACHE_DIR, { recursive: true });
 mkdirSync(INFO_DIR, { recursive: true });
 
@@ -73,6 +78,12 @@ function getState(guildId) {
       seqCounter: 0,
       recentEnqueued: new Map(),
       recentCommands: new Map(),
+      radio: false,
+      radioBusy: false,
+      played: new Set(),
+      lastTrack: null,
+      emptyTimer: null,
+      moving: false,
       dead: false,
     });
   }
@@ -427,21 +438,79 @@ async function setVoiceStatus(gs, status) {
 const clearVoiceStatus = (gs) => setVoiceStatus(gs, "");
 const trackStatus = (track) => `♪ ${track.title}`.slice(0, STATUS_MAX);
 
+function updatePresence(track) {
+  try {
+    if (track) client.user?.setActivity({ name: track.title.slice(0, 120), type: ActivityType.Listening });
+    else client.user?.setPresence({ activities: [] });
+  } catch {}
+}
+
+const ytId = (url) =>
+  url?.match(/[?&]v=([\w-]{11})/)?.[1] ?? url?.match(/youtu\.be\/([\w-]{11})/)?.[1] ?? null;
+
+async function fillRadio(gs) {
+  const seed = gs.lastTrack;
+  if (!seed || gs.radioBusy || gs.dead) return;
+  const id = ytId(seed.url);
+  if (!id) {
+    console.log(`[radio] sem mix para fonte "${seed.source}", parando`);
+    return;
+  }
+  gs.radioBusy = true;
+  try {
+    const out = await runYtdlp([
+      "--flat-playlist", "-I", "2:15", ...PRINT_FLAT,
+      `https://www.youtube.com/watch?v=${id}&list=RD${id}`,
+    ]);
+    const pick = parseCandidates(out).find((c) => c.url !== seed.url && !gs.played.has(c.url));
+    if (!pick) {
+      console.log("[radio] mix sem faixa nova");
+      return;
+    }
+    console.log(`[radio] próxima: ${pick.title}`);
+    const track = {
+      title: pick.title,
+      url: pick.url,
+      source: "youtube",
+      thumb: pick.thumbnail,
+      duration: pick.duration,
+      by: "modo rádio",
+      seq: ++gs.seqCounter,
+      resolvedAt: Date.now(),
+    };
+    gs.queue.push(track);
+    if (!gs.current) playNext(gs);
+    else prefetch(track);
+  } catch (e) {
+    console.log(`[radio] falhou: ${shortErr(e)}`);
+  } finally {
+    gs.radioBusy = false;
+  }
+}
+
 function playNext(gs) {
   killProcs(gs);
   unduck(gs);
+  if (gs.current) gs.lastTrack = gs.current;
   const next = gs.queue.shift();
   gs.current = next ?? null;
   gs.currentResource = null;
   if (!next) {
     clearVoiceStatus(gs);
+    updatePresence(null);
+    saveQueues();
+    if (gs.radio) fillRadio(gs);
     return;
   }
+  gs.played.add(next.url);
+  if (gs.played.size > 120) gs.played.delete(gs.played.values().next().value);
   setVoiceStatus(gs, trackStatus(next));
+  updatePresence(next);
+  saveQueues();
   const cached = next.file && existsSync(next.file) ? next.file : cacheLookup(next.url);
   if (cached) next.file = cached;
   startPlayback(gs, next, cached ? "cache" : "info");
-  gs.textChannel?.send({ embeds: [nowPlayingEmbed(next)] }).catch(() => {});
+  gs.textChannel?.send({ embeds: [nowPlayingEmbed(next)], components: controls() }).catch(() => {});
 }
 
 const GOLD = 0xd4a017;
@@ -466,6 +535,73 @@ function nowPlayingEmbed(track) {
     thumbnail: track.thumb ? { url: track.thumb } : undefined,
     fields,
     footer: { text: "Campeão" },
+  };
+}
+
+const helpEmbed = () => ({
+  author: { name: "Como usar o Campeão" },
+  description: [
+    '**Por voz** (comigo no canal): *"Campeão, toca <música>"* — e também: pula, pausa, continua, para, rádio, letra, sai.',
+    'Com música tocando, diga só *"Campeão"*: o som abaixa e eu escuto por 2s.',
+    '**Fonte específica**: *"…no YouTube"* ou *"…no SoundCloud"*. Sem indicar, o Deezer identifica a faixa oficial.',
+    "**Slash**: `/tocar` sugere músicas enquanto você digita — e tem `/fila` `/radio` `/letra` `/pular` `/parar` `/sair`.",
+    "**Por texto**: `!entra` `!play` `!pula` `!pausa` `!continua` `!para` `!fila` `!radio` `!letra` `!sai`",
+    "**Modo rádio**: quando a fila acaba, eu sigo sozinho com faixas parecidas.",
+  ].join("\n"),
+  color: GOLD,
+  footer: { text: "Campeão" },
+});
+
+const controls = () => [
+  {
+    type: 1,
+    components: [
+      { type: 2, style: 2, custom_id: "cp:toggle", label: "Pausar / Continuar" },
+      { type: 2, style: 2, custom_id: "cp:skip", label: "Pular" },
+      { type: 2, style: 2, custom_id: "cp:queue", label: "Fila" },
+      { type: 2, style: 2, custom_id: "cp:lyrics", label: "Letra" },
+      { type: 2, style: 4, custom_id: "cp:stop", label: "Parar" },
+    ],
+  },
+];
+
+function queueEmbed(gs) {
+  const lines = [
+    gs.current ? `**Agora** · [${gs.current.title}](${gs.current.url})` : "Nada tocando.",
+    ...gs.queue.map((t, i) => `**${i + 1}** · ${t.title}`),
+  ];
+  if (gs.radio) lines.push("-# modo rádio ligado");
+  return { author: { name: "Fila" }, description: lines.join("\n").slice(0, 3900), color: GRAY };
+}
+
+async function fetchLyrics(track) {
+  const q = norm(track.title)
+    .replace(/\b(official|oficial|video|videoclipe|audio|lyrics|letra|hd|4k|clipe)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  try {
+    const res = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`, {
+      headers: { "user-agent": "campeao-bot (github.com/guilhermebsantiago/campeao-bot)" },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const hit = (await res.json()).find((x) => x.plainLyrics);
+    return hit ? { name: `${hit.artistName} — ${hit.trackName}`, text: hit.plainLyrics } : null;
+  } catch (e) {
+    console.log("[letra] erro:", e.message);
+    return null;
+  }
+}
+
+async function lyricsEmbed(gs) {
+  if (!gs.current) return { description: "-# Nada tocando.", color: GRAY };
+  const found = await fetchLyrics(gs.current);
+  if (!found) return { description: `-# Não achei a letra de “${gs.current.title}”`, color: GRAY };
+  return {
+    author: { name: "Letra" },
+    title: found.name,
+    description: found.text.slice(0, 4000),
+    color: GOLD,
   };
 }
 
@@ -505,6 +641,78 @@ function unduck(gs) {
   gs.currentResource?.volume?.setVolume(1);
 }
 
+const serializeTrack = (t) => ({
+  title: t.title,
+  url: t.url,
+  source: t.source,
+  thumb: t.thumb ?? null,
+  duration: t.duration ?? null,
+  by: t.by,
+  seq: t.seq ?? 0,
+});
+
+let saveTimer = null;
+
+function writeQueues() {
+  const data = [];
+  for (const gs of guilds.values()) {
+    if (!gs.voiceChannelId || (!gs.current && !gs.queue.length)) continue;
+    data.push({
+      guildId: gs.guildId,
+      voiceChannelId: gs.voiceChannelId,
+      textChannelId: gs.textChannel?.id ?? null,
+      radio: gs.radio,
+      tracks: [gs.current, ...gs.queue].filter(Boolean).map(serializeTrack),
+    });
+  }
+  try {
+    writeFileSync(QUEUE_FILE, JSON.stringify(data));
+  } catch (e) {
+    console.log("[fila] falha ao salvar:", e.message);
+  }
+}
+
+function saveQueues() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    writeQueues();
+  }, 2000);
+}
+
+async function restoreQueues() {
+  if (!existsSync(QUEUE_FILE)) return;
+  let data;
+  try {
+    data = JSON.parse(readFileSync(QUEUE_FILE, "utf8"));
+  } catch {
+    return;
+  }
+  for (const entry of data ?? []) {
+    try {
+      const guild = await client.guilds.fetch(entry.guildId);
+      const voice = await guild.channels.fetch(entry.voiceChannelId);
+      if (!voice?.members?.filter((m) => !m.user.bot).size) {
+        console.log("[fila] canal vazio, não retomo");
+        continue;
+      }
+      const text = entry.textChannelId
+        ? await guild.channels.fetch(entry.textChannelId).catch(() => null)
+        : null;
+      const gs = connect(guild, voice, text);
+      if (!gs) continue;
+      gs.radio = Boolean(entry.radio);
+      gs.queue = entry.tracks.map((t) => ({ ...t }));
+      gs.seqCounter = gs.queue.reduce((m, t) => Math.max(m, t.seq ?? 0), 0);
+      console.log(`[fila] retomando ${gs.queue.length} faixa(s) em "${voice.name}"`);
+      text?.send("-# Voltei — retomando a fila de onde parou.").catch(() => {});
+      playNext(gs);
+    } catch (e) {
+      console.log("[fila] restore falhou:", e.message);
+    }
+  }
+}
+
 async function enqueue(gs, rawQuery, by) {
   const { query, source } = parseSource(rawQuery);
   const seq = ++gs.seqCounter;
@@ -536,12 +744,23 @@ async function enqueue(gs, rawQuery, by) {
     playNext(gs);
   } else {
     prefetch(track);
+    saveQueues();
     gs.textChannel?.send({ embeds: [queuedEmbed(track, gs.queue.indexOf(track) + 1)] }).catch(() => {});
   }
 }
 
+function toggleRadio(gs, who) {
+  gs.radio = !gs.radio;
+  saveQueues();
+  gs.textChannel
+    ?.send(`-# Modo rádio **${gs.radio ? "ligado" : "desligado"}** por ${who}`)
+    .catch(() => {});
+  if (gs.radio && !gs.current && !gs.queue.length) fillRadio(gs);
+}
+
 function stopAll(gs) {
   for (const t of [gs.current, ...gs.queue]) dropTrackFile(t);
+  gs.radio = false;
   gs.queue = [];
   gs.current = null;
   gs.currentResource = null;
@@ -549,12 +768,18 @@ function stopAll(gs) {
   unduck(gs);
   gs.player.stop();
   clearVoiceStatus(gs);
+  updatePresence(null);
+  saveQueues();
 }
 
 function teardown(gs) {
   if (guilds.get(gs.guildId) === gs) guilds.delete(gs.guildId);
   gs.dead = true;
+  if (gs.emptyTimer) clearTimeout(gs.emptyTimer);
+  gs.emptyTimer = null;
   clearVoiceStatus(gs);
+  updatePresence(null);
+  saveQueues();
   try {
     for (const t of [gs.current, ...gs.queue]) dropTrackFile(t);
     gs.queue = [];
@@ -584,6 +809,24 @@ function to16kMono(pcm) {
   return out;
 }
 
+function silenceRatio(mono16k) {
+  const frame = 320;
+  const total = Math.floor(mono16k.length / 2);
+  const rms = [];
+  for (let i = 0; i + frame <= total; i += frame) {
+    let sum = 0;
+    for (let j = 0; j < frame; j++) {
+      const s = mono16k.readInt16LE((i + j) * 2);
+      sum += s * s;
+    }
+    rms.push(Math.sqrt(sum / frame));
+  }
+  if (!rms.length) return 1;
+  const mean = rms.reduce((a, b) => a + b, 0) / rms.length;
+  if (mean === 0) return 1;
+  return rms.filter((r) => r < mean * 0.25).length / rms.length;
+}
+
 let sttPending = 0;
 
 function wavFrom(pcm) {
@@ -609,6 +852,7 @@ async function groqTranscribe(pcm) {
   fd.append("file", new Blob([wavFrom(pcm)], { type: "audio/wav" }), "audio.wav");
   fd.append("model", "whisper-large-v3-turbo");
   fd.append("language", "pt");
+  fd.append("prompt", STT_PROMPT);
   const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
     method: "POST",
     headers: { authorization: `Bearer ${GROQ_KEY}` },
@@ -686,13 +930,21 @@ function captureUtterance(gs, userId) {
     const pcm = Buffer.concat(chunks);
     const secs = pcm.length / (48000 * 2 * 2);
     if (secs < 0.6) return;
-    if (secs > 6) {
-      console.log(`[voz] descartando fala de ${secs.toFixed(1)}s (longa demais, provável vazamento de música)`);
+    if (secs > MAX_UTTERANCE_S) {
+      console.log(`[voz] descartando ${secs.toFixed(1)}s (acima do limite de ${MAX_UTTERANCE_S}s)`);
       return;
+    }
+    const mono = to16kMono(pcm);
+    if (secs > 6) {
+      const ratio = silenceRatio(mono);
+      if (ratio < MUSIC_SILENCE_RATIO) {
+        console.log(`[voz] descartando ${secs.toFixed(1)}s (pausas ${(ratio * 100).toFixed(0)}%, provável música)`);
+        return;
+      }
     }
     const attentive = (gs.attention.get(userId) ?? 0) > startedAt;
     if (attentive) playBeep(gs);
-    const text = await transcribe(to16kMono(pcm), attentive);
+    const text = await transcribe(mono, attentive);
     console.log(`[stt] ${user?.username ?? userId}: "${text}"`);
     if (text) handleVoice(gs, userId, text, startedAt);
   });
@@ -770,6 +1022,14 @@ function handleVoice(gs, userId, raw, startedAt) {
     gs.textChannel?.send(`-# Parada por ${mention} — fila limpa`).catch(() => {});
     return;
   }
+  if (/^(radio|hadio|radiu)$/.test(head) || /^(radio|hadio)\b/.test(rest)) {
+    toggleRadio(gs, mention);
+    return;
+  }
+  if (/^letra/.test(head)) {
+    lyricsEmbed(gs).then((e) => gs.textChannel?.send({ embeds: [e] }).catch(() => {}));
+    return;
+  }
   if (LEAVE_VERBS.includes(head)) {
     gs.textChannel?.send(`Até mais! Dispensado por ${mention}.`).catch(() => {});
     leave(gs);
@@ -781,13 +1041,50 @@ function handleVoice(gs, userId, raw, startedAt) {
   console.log(`[wake] não entendi: "${rest}"`);
 }
 
+function humansIn(channelId) {
+  const ch = channelId ? client.channels.cache.get(channelId) : null;
+  return ch?.members ? ch.members.filter((m) => !m.user.bot).size : 0;
+}
+
+function moveTo(gs, voice) {
+  console.log(`[voz] mudando para "${voice.name}"`);
+  clearVoiceStatus(gs);
+  gs.moving = true;
+  gs.voiceChannelId = voice.id;
+  gs.statusText = null;
+  joinVoiceChannel({
+    channelId: voice.id,
+    guildId: gs.guildId,
+    adapterCreator: voice.guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false,
+  });
+  setTimeout(() => { gs.moving = false; }, 5000);
+  if (gs.current) setVoiceStatus(gs, trackStatus(gs.current));
+}
+
 function joinFor(member, channel) {
-  const gs = getState(member.guild.id);
-  gs.textChannel = channel;
-  if (gs.connection) return gs;
+  const existing = guilds.get(member.guild.id);
   const voice = member.voice.channel;
-  if (!voice) return null;
-  const zombie = getVoiceConnection(member.guild.id);
+  if (existing?.connection) {
+    if (channel) existing.textChannel = channel;
+    if (voice && voice.id !== existing.voiceChannelId) {
+      if (humansIn(existing.voiceChannelId) > 0) {
+        return { error: "busy", channelId: existing.voiceChannelId };
+      }
+      moveTo(existing, voice);
+    }
+    return { gs: existing };
+  }
+  if (!voice) return { error: "no_voice" };
+  return { gs: connect(member.guild, voice, channel) };
+}
+
+function connect(guild, voice, channel) {
+  const gs = getState(guild.id);
+  if (channel) gs.textChannel = channel;
+  if (gs.connection) return gs;
+  const zombie = getVoiceConnection(guild.id);
   if (zombie) {
     console.log("[voz] destruindo conexão órfã antes de entrar");
     try { zombie.destroy(); } catch {}
@@ -795,15 +1092,15 @@ function joinFor(member, channel) {
   gs.voiceChannelId = voice.id;
   gs.connection = joinVoiceChannel({
     channelId: voice.id,
-    guildId: member.guild.id,
-    adapterCreator: member.guild.voiceAdapterCreator,
+    guildId: guild.id,
+    adapterCreator: guild.voiceAdapterCreator,
     selfDeaf: false,
     selfMute: false,
   });
   gs.connection.on("stateChange", (oldS, newS) => {
     if (oldS.status === newS.status) return;
     console.log(`[voz] conexão: ${oldS.status} -> ${newS.status}`);
-    if (newS.status === "destroyed" || newS.status === "disconnected") {
+    if (newS.status === "destroyed" || (newS.status === "disconnected" && !gs.moving)) {
       teardown(gs);
     }
   });
@@ -834,7 +1131,7 @@ function joinFor(member, channel) {
     playNext(gs);
   });
   gs.connection.receiver.speaking.on("start", (userId) => captureUtterance(gs, userId));
-  console.log(`[voz] entrei em "${voice.name}" (${member.guild.name})`);
+  console.log(`[voz] entrei em "${voice.name}" (${guild.name})`);
   return gs;
 }
 
@@ -854,9 +1151,13 @@ client.on(Events.MessageCreate, async (m) => {
   const command = cmd.toLowerCase();
 
   if (["entra", "play", "p", "toca"].includes(command)) {
-    const gs = joinFor(m.member, m.channel);
-    if (!gs) {
+    const { gs, error, channelId } = joinFor(m.member, m.channel);
+    if (error === "no_voice") {
       m.reply("-# Entre num canal de voz primeiro").catch(() => {});
+      return;
+    }
+    if (error === "busy") {
+      m.reply(`-# Já estou tocando em <#${channelId}>`).catch(() => {});
       return;
     }
     if (command === "entra") {
@@ -891,34 +1192,190 @@ client.on(Events.MessageCreate, async (m) => {
   else if (["para", "stop"].includes(command)) stopAll(gs);
   else if (command === "pausa") gs.player.pause();
   else if (["continua", "resume"].includes(command)) gs.player.unpause();
-  else if (command === "fila") {
-    const lines = [
-      gs.current ? `**Agora** · [${gs.current.title}](${gs.current.url})` : "Nada tocando.",
-      ...gs.queue.map((t, i) => `**${i + 1}** · ${t.title}`),
-    ];
-    m.reply({ embeds: [{ author: { name: "Fila" }, description: lines.join("\n").slice(0, 3900), color: GRAY }] }).catch(() => {});
+  else if (command === "fila") m.reply({ embeds: [queueEmbed(gs)] }).catch(() => {});
+  else if (command === "radio") toggleRadio(gs, `${m.author}`);
+  else if (command === "letra") {
+    lyricsEmbed(gs).then((e) => m.reply({ embeds: [e] }).catch(() => {}));
   } else if (["sai", "sair"].includes(command)) leave(gs);
-  else if (command === "ajuda") {
-    m.reply({
-      embeds: [
-        {
-          author: { name: "Como usar o Campeão" },
-          description: [
-            '**Por voz** (comigo no canal): *"Campeão, toca <música>"* — e também: pula, pausa, continua, para, sai.',
-            'Com música tocando, diga só *"Campeão"*: o som abaixa e eu escuto por 2s.',
-            '**Fonte específica**: *"…no YouTube"* ou *"…no SoundCloud"*. Sem indicar, o Deezer identifica a faixa oficial.',
-            "**Por texto**: `!entra` `!play` `!pula` `!pausa` `!continua` `!para` `!fila` `!sai`",
-          ].join("\n"),
-          color: GOLD,
-          footer: { text: "Campeão" },
-        },
-      ],
-    }).catch(() => {});
+  else if (command === "ajuda") m.reply({ embeds: [helpEmbed()] }).catch(() => {});
+});
+
+client.on(Events.VoiceStateUpdate, (oldS, newS) => {
+  const gs = guilds.get((newS.guild ?? oldS.guild).id);
+  if (!gs || gs.dead) return;
+  if (newS.id === client.user.id) {
+    if (!newS.channelId) return;
+    gs.voiceChannelId = newS.channelId;
+  }
+  if (!gs.voiceChannelId) return;
+  if (humansIn(gs.voiceChannelId) > 0) {
+    if (gs.emptyTimer) {
+      clearTimeout(gs.emptyTimer);
+      gs.emptyTimer = null;
+    }
+    return;
+  }
+  if (gs.emptyTimer) return;
+  console.log("[voz] canal vazio, saindo em 60s");
+  gs.emptyTimer = setTimeout(() => {
+    gs.emptyTimer = null;
+    if (gs.dead || humansIn(gs.voiceChannelId) > 0) return;
+    gs.textChannel?.send("-# Canal vazio — saindo.").catch(() => {});
+    leave(gs);
+  }, EMPTY_LEAVE_MS);
+});
+
+const SLASH = [
+  {
+    name: "tocar",
+    description: "Toca uma música (ou põe na fila)",
+    options: [
+      { name: "musica", description: "Nome ou link", type: 3, required: true, autocomplete: true },
+    ],
+  },
+  { name: "pular", description: "Pula a música atual" },
+  { name: "pausar", description: "Pausa a reprodução" },
+  { name: "continuar", description: "Retoma a reprodução" },
+  { name: "parar", description: "Para tudo e limpa a fila" },
+  { name: "fila", description: "Mostra a fila" },
+  { name: "radio", description: "Liga/desliga o modo rádio" },
+  { name: "letra", description: "Mostra a letra da música atual" },
+  { name: "sair", description: "Faz o Campeão sair do canal" },
+  { name: "ajuda", description: "Como usar o Campeão" },
+];
+
+async function handleAutocomplete(i) {
+  const typed = i.options.getFocused();
+  if (!typed || typed.length < 2 || /^https?:\/\//.test(typed)) {
+    await i.respond([]).catch(() => {});
+    return;
+  }
+  let choices = [];
+  try {
+    const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(typed)}&limit=8`, {
+      signal: AbortSignal.timeout(2000),
+    });
+    choices = ((await res.json()).data ?? [])
+      .map((t) => `${t.artist?.name} - ${t.title}`)
+      .filter((v, idx, arr) => v && arr.indexOf(v) === idx)
+      .slice(0, 8)
+      .map((v) => ({ name: v.slice(0, 100), value: v.slice(0, 100) }));
+  } catch {}
+  await i.respond(choices).catch(() => {});
+}
+
+async function handleSlash(i) {
+  const name = i.commandName;
+  if (name === "ajuda") {
+    await i.reply({ embeds: [helpEmbed()], flags: MessageFlags.Ephemeral }).catch(() => {});
+    return;
+  }
+  if (!i.guildId || !i.member) {
+    await i.reply({ content: "-# Só funciono dentro de um servidor", flags: MessageFlags.Ephemeral }).catch(() => {});
+    return;
+  }
+  if (name === "tocar") {
+    const { gs, error, channelId } = joinFor(i.member, i.channel);
+    if (error === "no_voice") {
+      await i.reply({ content: "-# Entre num canal de voz primeiro", flags: MessageFlags.Ephemeral }).catch(() => {});
+      return;
+    }
+    if (error === "busy") {
+      await i.reply({ content: `-# Já estou tocando em <#${channelId}>`, flags: MessageFlags.Ephemeral }).catch(() => {});
+      return;
+    }
+    const query = i.options.getString("musica");
+    await i.reply(`-# ${i.user} pediu “${query}” — buscando…`).catch(() => {});
+    await enqueue(gs, query, `${i.user}`);
+    return;
+  }
+  const gs = guilds.get(i.guildId);
+  if (!gs) {
+    await i.reply({ content: "-# Não estou tocando nada", flags: MessageFlags.Ephemeral }).catch(() => {});
+    return;
+  }
+  gs.textChannel = i.channel;
+  if (name === "fila") {
+    await i.reply({ embeds: [queueEmbed(gs)] }).catch(() => {});
+    return;
+  }
+  if (name === "letra") {
+    await i.deferReply().catch(() => {});
+    await i.editReply({ embeds: [await lyricsEmbed(gs)] }).catch(() => {});
+    return;
+  }
+  if (name === "radio") {
+    toggleRadio(gs, `${i.user}`);
+    await i.reply({ content: `-# Modo rádio **${gs.radio ? "ligado" : "desligado"}**`, flags: MessageFlags.Ephemeral }).catch(() => {});
+    return;
+  }
+  const actions = {
+    pular: () => { playNext(gs); return "Pulada"; },
+    pausar: () => { gs.player.pause(); return "Pausada"; },
+    continuar: () => { unduck(gs); gs.player.unpause(); return "Retomada"; },
+    parar: () => { stopAll(gs); return "Parada — fila limpa"; },
+    sair: () => { leave(gs); return "Saindo"; },
+  };
+  const done = actions[name]?.();
+  if (done) await i.reply(`-# ${done} por ${i.user}`).catch(() => {});
+}
+
+async function handleButton(i) {
+  const gs = i.guildId ? guilds.get(i.guildId) : null;
+  if (!gs) {
+    await i.reply({ content: "-# Não estou tocando nada", flags: MessageFlags.Ephemeral }).catch(() => {});
+    return;
+  }
+  gs.textChannel = i.channel;
+  switch (i.customId) {
+    case "cp:toggle": {
+      const paused = gs.player.state.status === AudioPlayerStatus.Paused;
+      if (paused) {
+        unduck(gs);
+        gs.player.unpause();
+      } else {
+        gs.player.pause();
+      }
+      await i.reply(`-# ${paused ? "Retomada" : "Pausada"} por ${i.user}`).catch(() => {});
+      return;
+    }
+    case "cp:skip":
+      playNext(gs);
+      await i.reply(`-# Pulada por ${i.user}`).catch(() => {});
+      return;
+    case "cp:stop":
+      stopAll(gs);
+      await i.reply(`-# Parada por ${i.user} — fila limpa`).catch(() => {});
+      return;
+    case "cp:queue":
+      await i.reply({ embeds: [queueEmbed(gs)], flags: MessageFlags.Ephemeral }).catch(() => {});
+      return;
+    case "cp:lyrics":
+      await i.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+      await i.editReply({ embeds: [await lyricsEmbed(gs)] }).catch(() => {});
+      return;
+  }
+}
+
+client.on(Events.InteractionCreate, async (i) => {
+  try {
+    if (i.isAutocomplete()) await handleAutocomplete(i);
+    else if (i.isButton()) await handleButton(i);
+    else if (i.isChatInputCommand()) await handleSlash(i);
+  } catch (e) {
+    console.log("[interacao] erro:", e.message);
   }
 });
 
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
   console.log(`Campeão online como ${client.user.tag}`);
+  try {
+    await client.application.commands.set(SLASH);
+    console.log(`[slash] ${SLASH.length} comandos registrados`);
+  } catch (e) {
+    console.log("[slash] falha ao registrar:", e.message);
+  }
+  await restoreQueues();
 });
 
 async function warmupYoutube() {
@@ -949,6 +1406,18 @@ try {
 } catch (e) {
   console.error("Falha ao gerar bip (seguindo sem):", e.message);
 }
+function flushAndExit() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  console.log("[fila] salvando antes de encerrar");
+  writeQueues();
+  process.exit(0);
+}
+
+for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, flushAndExit);
+
 client.login(TOKEN).catch((e) => {
   console.error("Falha no login do Discord:", e.message);
   process.exit(1);

@@ -6,9 +6,21 @@ Bot de música do Discord controlado por voz, estilo Alexa. Fica no canal de voz
 
 ## Comandos
 
-**Por voz** (com o bot no canal): `toca <música>`, `pula`, `pausa`, `continua`, `para`, `sai` — sempre precedidos de "Campeão". Falar só "Campeão" toca um bip (ou abaixa a música) e abre uma janela de 10s ouvindo você.
+**Por voz** (com o bot no canal): `toca <música>`, `pula`, `pausa`, `continua`, `para`, `radio`, `letra`, `sai` — sempre precedidos de "Campeão". Falar só "Campeão" toca um bip (ou abaixa a música) e abre uma janela ouvindo você.
 
-**Por texto**: `!entra`, `!play <música>`, `!pula`, `!pausa`, `!continua`, `!para`, `!fila`, `!sai`, `!ajuda`
+**Slash**: `/tocar` (sugere músicas do Deezer enquanto você digita), `/pular`, `/pausar`, `/continuar`, `/parar`, `/fila`, `/radio`, `/letra`, `/sair`, `/ajuda`
+
+**Por texto**: `!entra`, `!play <música>`, `!pula`, `!pausa`, `!continua`, `!para`, `!fila`, `!radio`, `!letra`, `!sai`, `!ajuda`
+
+**Botões**: todo "Tocando agora" vem com pausar/continuar, pular, fila, letra e parar.
+
+## Comportamentos
+
+- **Status do canal de voz** mostra a faixa atual e é limpo ao sair.
+- **Modo rádio**: acabou a fila, o bot segue sozinho com faixas do mix do YouTube.
+- **Sai sozinho** 60s depois que o canal de voz esvazia.
+- **Fila persistente**: sobrevive a restart/redeploy (salva em `/data/queue.json`).
+- **Letras** via [lrclib.net](https://lrclib.net).
 
 ## Stack
 
