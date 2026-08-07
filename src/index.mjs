@@ -143,7 +143,7 @@ function parseSource(raw) {
 async function deezerLookup(query) {
   try {
     const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=1`, {
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(3000),
     });
     const track = (await res.json()).data?.[0];
     if (!track?.title) return null;
@@ -228,48 +228,85 @@ function scoreCandidate(c, want, opts = {}) {
 
 const shortErr = (e) => (e.stderr || e.message || "").toString().replace(/\s+/g, " ").slice(0, 250);
 
-async function tryYoutube(want, forcedTitle, dzMeta, tag) {
+const VALIDATE_TOP = 3;
+
+async function extractInfo(url) {
   try {
-    const flat = parseCandidates(await runYtdlp(["-i", "--flat-playlist", ...PRINT_FLAT, `ytsearch6:${want.query}`]))
+    const raw = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", url]);
+    const info = JSON.parse(raw.trim().split("\n").filter(Boolean)[0]);
+    return info?.webpage_url ? { info } : {};
+  } catch (e) {
+    const err = shortErr(e);
+    console.log(`[busca] validação falhou: ${err}`);
+    return { blocked: /sign in|not a bot/i.test(err) };
+  }
+}
+
+async function tryYoutube(want, forcedTitle, dzMeta, tag) {
+  let flat;
+  try {
+    flat = parseCandidates(await runYtdlp(["-i", "--flat-playlist", ...PRINT_FLAT, `ytsearch6:${want.query}`]))
       .map((c) => ({ ...c, score: scoreCandidate(c, want) }))
       .sort((a, b) => b.score - a.score);
-    console.log(`[busca] youtube (${tag}): ${flat.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 45)}`).join(" | ")}`);
-    for (const cand of flat.slice(0, 3)) {
-      try {
-        const raw = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", cand.url]);
-        const info = JSON.parse(raw.trim().split("\n").filter(Boolean)[0]);
-        if (info?.webpage_url) {
-          const infoFile = `${INFO_DIR}/${cacheKey(info.webpage_url)}.info.json`;
-          writeFileSync(infoFile, JSON.stringify(info));
-          pruneInfo();
-          return {
-            title: forcedTitle ?? info.title,
-            url: info.webpage_url,
-            source: "youtube",
-            thumb: dzMeta?.cover ?? info.thumbnail,
-            duration: dzMeta?.duration ?? info.duration,
-            infoFile,
-            resolvedAt: Date.now(),
-          };
-        }
-      } catch (e) {
-        const err = shortErr(e);
-        console.log(`[busca] validação falhou: ${err}`);
-        if (/sign in|not a bot/i.test(err)) break;
-      }
-    }
   } catch (e) {
     console.log(`[busca] youtube falhou (${tag}): ${shortErr(e)}`);
+    return {};
   }
-  return null;
+  console.log(`[busca] youtube (${tag}): ${flat.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 45)}`).join(" | ")}`);
+  const pending = flat.slice(0, VALIDATE_TOP).map((c) => extractInfo(c.url));
+  for (const p of pending) {
+    const { info, blocked } = await p;
+    if (blocked) return { blocked: true };
+    if (!info) continue;
+    const infoFile = `${INFO_DIR}/${cacheKey(info.webpage_url)}.info.json`;
+    writeFileSync(infoFile, JSON.stringify(info));
+    pruneInfo();
+    return {
+      track: {
+        title: forcedTitle ?? info.title,
+        url: info.webpage_url,
+        source: "youtube",
+        thumb: dzMeta?.cover ?? info.thumbnail,
+        duration: dzMeta?.duration ?? info.duration,
+        infoFile,
+        resolvedAt: Date.now(),
+      },
+    };
+  }
+  return {};
+}
+
+const RESOLVE_TTL_MS = 60 * 60 * 1000;
+const resolveCache = new Map();
+
+function resolveCached(key) {
+  const hit = resolveCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > RESOLVE_TTL_MS) {
+    resolveCache.delete(key);
+    return null;
+  }
+  return { ...hit.track };
+}
+
+function rememberResolve(key, track) {
+  resolveCache.set(key, { at: Date.now(), track: { ...track } });
+  if (resolveCache.size > 200) resolveCache.delete(resolveCache.keys().next().value);
+  return { ...track };
 }
 
 async function resolveTrack(query, source = "auto", hint = null) {
+  const key = `${source}:${norm(query)}`;
+  const cached = resolveCached(key);
+  if (cached) {
+    console.log(`[busca] cache de resolução: "${query}" -> ${cached.title}`);
+    return cached;
+  }
   if (/^https?:\/\//.test(query)) {
     try {
       const c = parseCandidates(await runYtdlp(["--no-playlist", "-f", "bestaudio/best", ...PRINT_FULL, query]))[0];
       return c
-        ? { title: c.title, url: c.url, source: "url", thumb: c.thumbnail, duration: c.duration, resolvedAt: Date.now() }
+        ? rememberResolve(key, { title: c.title, url: c.url, source: "url", thumb: c.thumbnail, duration: c.duration, resolvedAt: Date.now() })
         : null;
     } catch (e) {
       console.log(`[busca] url falhou: ${shortErr(e)}`);
@@ -288,12 +325,13 @@ async function resolveTrack(query, source = "auto", hint = null) {
     }
   }
   if (source !== "soundcloud") {
-    let yt = await tryYoutube(want, forcedTitle, dzMeta, "refinada");
-    if (!yt && norm(want.query) !== norm(query)) {
+    let r = await tryYoutube(want, forcedTitle, dzMeta, "refinada");
+    if (!r.track && !r.blocked && norm(want.query) !== norm(query)) {
       console.log("[busca] youtube não deu com a consulta refinada, tentando a original");
-      yt = await tryYoutube({ query, duration: want.duration }, forcedTitle, dzMeta, "original");
+      r = await tryYoutube({ query, duration: want.duration }, forcedTitle, dzMeta, "original");
     }
-    if (yt) return yt;
+    if (r.track) return rememberResolve(key, r.track);
+    if (r.blocked) console.log("[busca] youtube bloqueou (bot check) — pulei a segunda tentativa");
     if (source !== "youtube") console.log("[busca] youtube esgotado — caindo pro soundcloud");
   }
   if (source !== "youtube") {
@@ -304,14 +342,14 @@ async function resolveTrack(query, source = "auto", hint = null) {
       const best = candidates[0];
       if (best) {
         console.log(`[busca] soundcloud: ${candidates.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 45)}`).join(" | ")}`);
-        return {
+        return rememberResolve(key, {
           title: forcedTitle ?? best.title,
           url: best.url,
           source: "soundcloud",
           thumb: dzMeta?.cover ?? best.thumbnail,
           duration: dzMeta?.duration ?? best.duration,
           resolvedAt: Date.now(),
-        };
+        });
       }
     } catch (e) {
       console.log(`[busca] soundcloud falhou: ${shortErr(e)}`);
