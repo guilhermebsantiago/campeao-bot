@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -e
+mkdir -p /data/hf /data/cache
 if [ -n "$COOKIES_B64" ]; then
   echo "$COOKIES_B64" | base64 -d > /data/cookies.txt
   echo "cookies.txt instalado ($(wc -l < /data/cookies.txt) linhas)"
