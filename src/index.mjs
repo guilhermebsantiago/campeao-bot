@@ -18,7 +18,7 @@ import prism from "prism-media";
 
 const execFileP = promisify(execFile);
 const TOKEN = process.env.DISCORD_TOKEN;
-const POT_URL = process.env.POT_PROVIDER_URL;
+const POT_URL = process.env.POT_PROVIDER_URL ?? "http://127.0.0.1:4416";
 const GROQ_KEY = process.env.GROQ_API_KEY;
 const COOKIES_FILE = "/data/cookies.txt";
 const hasCookies = existsSync(COOKIES_FILE);

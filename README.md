@@ -28,6 +28,18 @@ Bot de música do Discord controlado por voz, estilo Alexa. Fica no canal de voz
 - faster-whisper (STT local em português, CPU, sem API paga)
 - yt-dlp (busca YouTube com fallback SoundCloud)
 
+## Variáveis de ambiente
+
+| Variável | Obrigatória | Default | Para quê |
+| --- | --- | --- | --- |
+| `DISCORD_TOKEN` | **sim** | — | token do bot |
+| `GROQ_API_KEY` | não | — | STT rápido na nuvem; sem ela usa só o Whisper local (mais lento, 1 fala por vez) |
+| `COOKIES_B64` | não | — | `cookies.txt` do YouTube em base64; reduz muito o bloqueio de bot |
+| `POT_PROVIDER_URL` | não | `http://127.0.0.1:4416` | servidor PO token que o próprio container sobe |
+| `WHISPER_MODEL` | não | `base` | modelo do faster-whisper (`small` é bem melhor em pt) |
+| `WHISPER_THREADS` | não | `4` | threads de CPU do STT local |
+| `WHISPER_PROMPT` | não | vocabulário do bot | enviesa o STT local |
+
 ## Rodar
 
 ```bash
