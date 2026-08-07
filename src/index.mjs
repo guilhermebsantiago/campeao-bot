@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
-import { Client, Events, GatewayIntentBits } from "discord.js";
+import { Client, Events, GatewayIntentBits, Routes } from "discord.js";
 import {
   AudioPlayerStatus,
   createAudioPlayer,
@@ -59,6 +59,8 @@ function getState(guildId) {
     guilds.set(guildId, {
       guildId,
       connection: null,
+      voiceChannelId: null,
+      statusText: null,
       player: null,
       queue: [],
       current: null,
@@ -410,13 +412,32 @@ function startPlayback(gs, track, mode) {
   gs.player.play(resource);
 }
 
+const STATUS_MAX = 250;
+
+async function setVoiceStatus(gs, status) {
+  if (!gs.voiceChannelId || gs.statusText === status) return;
+  gs.statusText = status;
+  try {
+    await client.rest.put(Routes.channelVoiceStatus(gs.voiceChannelId), { body: { status } });
+  } catch (e) {
+    console.log(`[status] falhou: ${(e.message ?? "").slice(0, 120)}`);
+  }
+}
+
+const clearVoiceStatus = (gs) => setVoiceStatus(gs, "");
+const trackStatus = (track) => `♪ ${track.title}`.slice(0, STATUS_MAX);
+
 function playNext(gs) {
   killProcs(gs);
   unduck(gs);
   const next = gs.queue.shift();
   gs.current = next ?? null;
   gs.currentResource = null;
-  if (!next) return;
+  if (!next) {
+    clearVoiceStatus(gs);
+    return;
+  }
+  setVoiceStatus(gs, trackStatus(next));
   const cached = next.file && existsSync(next.file) ? next.file : cacheLookup(next.url);
   if (cached) next.file = cached;
   startPlayback(gs, next, cached ? "cache" : "info");
@@ -527,11 +548,13 @@ function stopAll(gs) {
   killProcs(gs);
   unduck(gs);
   gs.player.stop();
+  clearVoiceStatus(gs);
 }
 
 function teardown(gs) {
   if (guilds.get(gs.guildId) === gs) guilds.delete(gs.guildId);
   gs.dead = true;
+  clearVoiceStatus(gs);
   try {
     for (const t of [gs.current, ...gs.queue]) dropTrackFile(t);
     gs.queue = [];
@@ -769,6 +792,7 @@ function joinFor(member, channel) {
     console.log("[voz] destruindo conexão órfã antes de entrar");
     try { zombie.destroy(); } catch {}
   }
+  gs.voiceChannelId = voice.id;
   gs.connection = joinVoiceChannel({
     channelId: voice.id,
     guildId: member.guild.id,
@@ -798,6 +822,12 @@ function joinFor(member, channel) {
       return;
     }
     if (cur) playNext(gs);
+  });
+  gs.player.on(AudioPlayerStatus.Paused, () => {
+    if (gs.current) setVoiceStatus(gs, `⏸ ${gs.current.title}`.slice(0, STATUS_MAX));
+  });
+  gs.player.on(AudioPlayerStatus.Playing, () => {
+    if (gs.current) setVoiceStatus(gs, trackStatus(gs.current));
   });
   gs.player.on("error", (e) => {
     console.log("[player] erro:", e.message);
