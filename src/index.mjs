@@ -228,7 +228,43 @@ function scoreCandidate(c, want, opts = {}) {
 
 const shortErr = (e) => (e.stderr || e.message || "").toString().replace(/\s+/g, " ").slice(0, 250);
 
-async function resolveTrack(query, source = "auto") {
+async function tryYoutube(want, forcedTitle, dzMeta, tag) {
+  try {
+    const flat = parseCandidates(await runYtdlp(["-i", "--flat-playlist", ...PRINT_FLAT, `ytsearch6:${want.query}`]))
+      .map((c) => ({ ...c, score: scoreCandidate(c, want) }))
+      .sort((a, b) => b.score - a.score);
+    console.log(`[busca] youtube (${tag}): ${flat.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 45)}`).join(" | ")}`);
+    for (const cand of flat.slice(0, 3)) {
+      try {
+        const raw = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", cand.url]);
+        const info = JSON.parse(raw.trim().split("\n").filter(Boolean)[0]);
+        if (info?.webpage_url) {
+          const infoFile = `${INFO_DIR}/${cacheKey(info.webpage_url)}.info.json`;
+          writeFileSync(infoFile, JSON.stringify(info));
+          pruneInfo();
+          return {
+            title: forcedTitle ?? info.title,
+            url: info.webpage_url,
+            source: "youtube",
+            thumb: dzMeta?.cover ?? info.thumbnail,
+            duration: dzMeta?.duration ?? info.duration,
+            infoFile,
+            resolvedAt: Date.now(),
+          };
+        }
+      } catch (e) {
+        const err = shortErr(e);
+        console.log(`[busca] validação falhou: ${err}`);
+        if (/sign in|not a bot/i.test(err)) break;
+      }
+    }
+  } catch (e) {
+    console.log(`[busca] youtube falhou (${tag}): ${shortErr(e)}`);
+  }
+  return null;
+}
+
+async function resolveTrack(query, source = "auto", hint = null) {
   if (/^https?:\/\//.test(query)) {
     try {
       const c = parseCandidates(await runYtdlp(["--no-playlist", "-f", "bestaudio/best", ...PRINT_FULL, query]))[0];
@@ -242,7 +278,7 @@ async function resolveTrack(query, source = "auto") {
   }
   let forcedTitle = null;
   let dzMeta = null;
-  let want = { query, duration: null };
+  let want = { query, duration: hint?.duration ?? null };
   if (source !== "youtube" && source !== "soundcloud") {
     dzMeta = await deezerLookup(query);
     if (dzMeta) {
@@ -252,38 +288,13 @@ async function resolveTrack(query, source = "auto") {
     }
   }
   if (source !== "soundcloud") {
-    try {
-      const flat = parseCandidates(await runYtdlp(["-i", "--flat-playlist", ...PRINT_FLAT, `ytsearch6:${want.query}`]))
-        .map((c) => ({ ...c, score: scoreCandidate(c, want) }))
-        .sort((a, b) => b.score - a.score);
-      console.log(`[busca] youtube: ${flat.map((c) => `${c.score.toFixed(1)} ${c.title?.slice(0, 45)}`).join(" | ")}`);
-      for (const cand of flat.slice(0, 3)) {
-        try {
-          const raw = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", cand.url]);
-          const info = JSON.parse(raw.trim().split("\n").filter(Boolean)[0]);
-          if (info?.webpage_url) {
-            const infoFile = `${INFO_DIR}/${cacheKey(info.webpage_url)}.info.json`;
-            writeFileSync(infoFile, JSON.stringify(info));
-            pruneInfo();
-            return {
-              title: forcedTitle ?? info.title,
-              url: info.webpage_url,
-              source: "youtube",
-              thumb: dzMeta?.cover ?? info.thumbnail,
-              duration: dzMeta?.duration ?? info.duration,
-              infoFile,
-              resolvedAt: Date.now(),
-            };
-          }
-        } catch (e) {
-          const err = shortErr(e);
-          console.log(`[busca] validação falhou: ${err}`);
-          if (/sign in|not a bot/i.test(err)) break;
-        }
-      }
-    } catch (e) {
-      console.log(`[busca] youtube falhou: ${shortErr(e)}`);
+    let yt = await tryYoutube(want, forcedTitle, dzMeta, "refinada");
+    if (!yt && norm(want.query) !== norm(query)) {
+      console.log("[busca] youtube não deu com a consulta refinada, tentando a original");
+      yt = await tryYoutube({ query, duration: want.duration }, forcedTitle, dzMeta, "original");
     }
+    if (yt) return yt;
+    if (source !== "youtube") console.log("[busca] youtube esgotado — caindo pro soundcloud");
   }
   if (source !== "youtube") {
     try {
@@ -397,19 +408,20 @@ function prefetch(track, tag = "preload") {
 const FF_FAST = ["-analyzeduration", "0", "-probesize", "500K"];
 const FF_OUT = ["-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"];
 
-function startPlayback(gs, track, mode) {
+function startPlayback(gs, track, mode, seek = 0) {
   killProcs(gs);
   let ff;
+  const seekIn = seek > 0 ? ["-ss", String(seek)] : [];
   if (mode === "cache") {
-    console.log(`[player] tocando (cache): ${track.title}`);
-    ff = spawn("ffmpeg", ["-loglevel", "quiet", ...FF_FAST, "-i", track.file, ...FF_OUT]);
+    console.log(`[player] tocando (cache${seek ? `, de ${seek}s` : ""}): ${track.title}`);
+    ff = spawn("ffmpeg", ["-loglevel", "quiet", ...FF_FAST, ...seekIn, "-i", track.file, ...FF_OUT]);
     gs.procs = [ff];
   } else {
     const reusing = mode === "info" && infoFresh(track);
-    console.log(`[player] tocando (${reusing ? "info reaproveitado" : "extração completa"}): ${track.title}`);
+    console.log(`[player] tocando (${reusing ? "info reaproveitado" : "extração completa"}${seek ? `, de ${seek}s` : ""}): ${track.title}`);
     const args = reusing ? ["--load-info-json", track.infoFile] : ["--no-playlist", track.url];
     const ytdlp = spawn("yt-dlp", [...YTDLP_BASE, "-f", "bestaudio/best", "-q", "-o", "-", ...args]);
-    ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", ...FF_OUT]);
+    ff = spawn("ffmpeg", ["-loglevel", "quiet", "-i", "pipe:0", ...seekIn, ...FF_OUT]);
     ytdlp.stderr.on("data", (d) => console.log(`[yt-dlp] ${d.toString().trim().slice(0, 200)}`));
     ytdlp.stdout.pipe(ff.stdin);
     ff.stdin.on("error", () => {});
@@ -486,6 +498,39 @@ async function fillRadio(gs) {
   } finally {
     gs.radioBusy = false;
   }
+}
+
+const TRUNCATED_SLACK_MS = 20000;
+
+function looksTruncated(track, playedMs) {
+  if (!track?.duration || track.duration < 45) return false;
+  return playedMs > 1500 && playedMs < track.duration * 1000 - TRUNCATED_SLACK_MS;
+}
+
+async function rescueTrack(gs, cur, playedMs) {
+  cur.rescued = true;
+  const playedS = Math.floor(playedMs / 1000);
+  const seek = playedS > 15 ? playedS - 2 : 0;
+  console.log(
+    `[resgate] "${cur.title}" (${cur.source}) parou em ${playedS}s de ${Math.round(cur.duration)}s — reabrindo no youtube`,
+  );
+  const alt = await resolveTrack(cur.title, "youtube", { duration: cur.duration });
+  if (gs.dead || gs.current !== cur) return;
+  if (!alt) {
+    console.log("[resgate] youtube não devolveu alternativa, seguindo pra próxima");
+    playNext(gs);
+    return;
+  }
+  dropTrackFile(cur);
+  cur.url = alt.url;
+  cur.source = "youtube";
+  cur.infoFile = alt.infoFile;
+  cur.resolvedAt = alt.resolvedAt;
+  cur.file = null;
+  gs.textChannel
+    ?.send(`-# A faixa cortou em ${playedS}s — retomando pelo YouTube.`)
+    .catch(() => {});
+  startPlayback(gs, cur, "info", seek);
 }
 
 function playNext(gs) {
@@ -1110,7 +1155,9 @@ function connect(guild, voice, channel) {
   gs.player.on(AudioPlayerStatus.Idle, (oldState) => {
     if (oldState.resource !== gs.currentResource) return;
     const cur = gs.current;
-    if (cur && !cur.retried && (oldState.resource.playbackDuration ?? 0) < 1500) {
+    if (!cur) return;
+    const played = oldState.resource.playbackDuration ?? 0;
+    if (!cur.retried && played < 1500) {
       cur.retried = true;
       cur.file = null;
       cur.infoFile = null;
@@ -1118,7 +1165,11 @@ function connect(guild, voice, channel) {
       startPlayback(gs, cur, "completa");
       return;
     }
-    if (cur) playNext(gs);
+    if (!cur.rescued && looksTruncated(cur, played)) {
+      rescueTrack(gs, cur, played);
+      return;
+    }
+    playNext(gs);
   });
   gs.player.on(AudioPlayerStatus.Paused, () => {
     if (gs.current) setVoiceStatus(gs, `⏸ ${gs.current.title}`.slice(0, STATUS_MAX));
