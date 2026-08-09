@@ -17,10 +17,26 @@ import {
 import prism from "prism-media";
 
 const execFileP = promisify(execFile);
+
+const envNum = (name, fallback) => {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (Number.isNaN(n)) {
+    console.log(`[config] ${name}="${raw}" não é número, usando ${fallback}`);
+    return fallback;
+  }
+  return n;
+};
+const envFlag = (name) => ["1", "true", "yes", "on"].includes((process.env[name] ?? "").toLowerCase());
+
 const TOKEN = process.env.DISCORD_TOKEN;
+const DATA_DIR = process.env.DATA_DIR ?? "/data";
 const POT_URL = process.env.POT_PROVIDER_URL ?? "http://127.0.0.1:4416";
 const GROQ_KEY = process.env.GROQ_API_KEY;
-const COOKIES_FILE = "/data/cookies.txt";
+const GROQ_MODEL = process.env.GROQ_MODEL ?? "whisper-large-v3-turbo";
+const GROQ_RPM = envNum("GROQ_RPM", 18);
+const COOKIES_FILE = `${DATA_DIR}/cookies.txt`;
 const hasCookies = existsSync(COOKIES_FILE);
 const YTDLP_BASE = [
   "--js-runtimes", "node",
@@ -28,21 +44,28 @@ const YTDLP_BASE = [
   ...(hasCookies ? ["--cookies", COOKIES_FILE] : []),
   ...(POT_URL ? ["--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_URL}`] : []),
 ];
-const STT_URL = "http://127.0.0.1:5005/";
+const STT_URL = process.env.STT_URL ?? "http://127.0.0.1:5005/";
+const STT_PROMPT = process.env.STT_PROMPT ?? "Campeão, toca, pula, pausa, continua, para, sai, fila, rádio, letra, música.";
 const WAKE_WORDS = ["campeao", "campiao", "capiao", "campeaum", "campeon"];
-const ATTENTION_MS = 2500;
-const DUCK_VOLUME = 0.15;
-const DUCK_TIMEOUT_MS = 8000;
+const ATTENTION_MS = envNum("ATTENTION_MS", 2500);
+const DUCK_VOLUME = envNum("DUCK_VOLUME", 0.15);
+const DUCK_TIMEOUT_MS = envNum("DUCK_TIMEOUT_MS", 8000);
 const BEEP_FILE = "/tmp/beep.pcm";
-const CACHE_DIR = "/data/tracks";
+const CACHE_DIR = `${DATA_DIR}/tracks`;
 const INFO_DIR = "/tmp/info";
-const CACHE_MAX_FILES = 40;
+const QUEUE_FILE = `${DATA_DIR}/queue.json`;
+const CACHE_MAX_FILES = envNum("CACHE_MAX_FILES", 40);
 const INFO_TTL_MS = 3 * 60 * 60 * 1000;
-const QUEUE_FILE = "/data/queue.json";
-const EMPTY_LEAVE_MS = 60000;
-const MAX_UTTERANCE_S = 12;
-const MUSIC_SILENCE_RATIO = 0.08;
-const STT_PROMPT = "Campeão, toca, pula, pausa, continua, para, sai, fila, rádio, letra, música.";
+const MAX_UTTERANCE_S = envNum("MAX_UTTERANCE_S", 12);
+const MUSIC_SILENCE_RATIO = envNum("MUSIC_SILENCE_RATIO", 0.08);
+const SEARCH_CANDIDATES = envNum("SEARCH_CANDIDATES", 6);
+const VALIDATE_TOP = envNum("VALIDATE_TOP", 3);
+const RESOLVE_TTL_MS = envNum("RESOLVE_TTL_MIN", 60) * 60 * 1000;
+const RADIO_MIX_SIZE = envNum("RADIO_MIX_SIZE", 30);
+const IDLE_MS = envNum("IDLE_LEAVE_MS", 5 * 60 * 1000);
+const EMPTY_MS = envNum("EMPTY_LEAVE_MS", 60 * 1000);
+const WARMUP_VIDEO_ID = process.env.WARMUP_VIDEO_ID ?? "SRXH9AbT280";
+const WARMUP_INTERVAL_MS = envNum("WARMUP_INTERVAL_H", 4) * 60 * 60 * 1000;
 mkdirSync(CACHE_DIR, { recursive: true });
 mkdirSync(INFO_DIR, { recursive: true });
 
@@ -63,28 +86,32 @@ function getState(guildId) {
   if (!guilds.has(guildId)) {
     guilds.set(guildId, {
       guildId,
+      guild: null,
       connection: null,
       voiceChannelId: null,
       statusText: null,
+      moving: false,
       player: null,
       queue: [],
       current: null,
       currentResource: null,
       procs: [],
       textChannel: null,
+      nowPlayingMessage: null,
       listening: new Set(),
       attention: new Map(),
       duckTimer: null,
       seqCounter: 0,
       recentEnqueued: new Map(),
       recentCommands: new Map(),
-      radio: false,
-      radioBusy: false,
-      played: new Set(),
-      lastTrack: null,
-      emptyTimer: null,
-      moving: false,
       dead: false,
+      radio: false,
+      radioFilling: false,
+      played: new Set(),
+      vetoed: new Set(),
+      lastActivity: Date.now(),
+      emptySince: null,
+      idleTimer: null,
     });
   }
   return guilds.get(guildId);
@@ -143,7 +170,7 @@ function parseSource(raw) {
 async function deezerLookup(query) {
   try {
     const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=1`, {
-      signal: AbortSignal.timeout(3000),
+      signal: AbortSignal.timeout(8000),
     });
     const track = (await res.json()).data?.[0];
     if (!track?.title) return null;
@@ -228,8 +255,6 @@ function scoreCandidate(c, want, opts = {}) {
 
 const shortErr = (e) => (e.stderr || e.message || "").toString().replace(/\s+/g, " ").slice(0, 250);
 
-const VALIDATE_TOP = 3;
-
 async function extractInfo(url) {
   try {
     const raw = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", url]);
@@ -245,7 +270,7 @@ async function extractInfo(url) {
 async function tryYoutube(want, forcedTitle, dzMeta, tag) {
   let flat;
   try {
-    flat = parseCandidates(await runYtdlp(["-i", "--flat-playlist", ...PRINT_FLAT, `ytsearch6:${want.query}`]))
+    flat = parseCandidates(await runYtdlp(["-i", "--flat-playlist", ...PRINT_FLAT, `ytsearch${SEARCH_CANDIDATES}:${want.query}`]))
       .map((c) => ({ ...c, score: scoreCandidate(c, want) }))
       .sort((a, b) => b.score - a.score);
   } catch (e) {
@@ -276,7 +301,6 @@ async function tryYoutube(want, forcedTitle, dzMeta, tag) {
   return {};
 }
 
-const RESOLVE_TTL_MS = 60 * 60 * 1000;
 const resolveCache = new Map();
 
 function resolveCached(key) {
@@ -495,49 +519,6 @@ function updatePresence(track) {
   } catch {}
 }
 
-const ytId = (url) =>
-  url?.match(/[?&]v=([\w-]{11})/)?.[1] ?? url?.match(/youtu\.be\/([\w-]{11})/)?.[1] ?? null;
-
-async function fillRadio(gs) {
-  const seed = gs.lastTrack;
-  if (!seed || gs.radioBusy || gs.dead) return;
-  const id = ytId(seed.url);
-  if (!id) {
-    console.log(`[radio] sem mix para fonte "${seed.source}", parando`);
-    return;
-  }
-  gs.radioBusy = true;
-  try {
-    const out = await runYtdlp([
-      "--flat-playlist", "-I", "2:15", ...PRINT_FLAT,
-      `https://www.youtube.com/watch?v=${id}&list=RD${id}`,
-    ]);
-    const pick = parseCandidates(out).find((c) => c.url !== seed.url && !gs.played.has(c.url));
-    if (!pick) {
-      console.log("[radio] mix sem faixa nova");
-      return;
-    }
-    console.log(`[radio] próxima: ${pick.title}`);
-    const track = {
-      title: pick.title,
-      url: pick.url,
-      source: "youtube",
-      thumb: pick.thumbnail,
-      duration: pick.duration,
-      by: "modo rádio",
-      seq: ++gs.seqCounter,
-      resolvedAt: Date.now(),
-    };
-    gs.queue.push(track);
-    if (!gs.current) playNext(gs);
-    else prefetch(track);
-  } catch (e) {
-    console.log(`[radio] falhou: ${shortErr(e)}`);
-  } finally {
-    gs.radioBusy = false;
-  }
-}
-
 const TRUNCATED_SLACK_MS = 20000;
 
 function looksTruncated(track, playedMs) {
@@ -574,7 +555,6 @@ async function rescueTrack(gs, cur, playedMs) {
 function playNext(gs) {
   killProcs(gs);
   unduck(gs);
-  if (gs.current) gs.lastTrack = gs.current;
   const next = gs.queue.shift();
   gs.current = next ?? null;
   gs.currentResource = null;
@@ -582,18 +562,70 @@ function playNext(gs) {
     clearVoiceStatus(gs);
     updatePresence(null);
     saveQueues();
-    if (gs.radio) fillRadio(gs);
+    if (gs.radio) radioFill(gs, true);
     return;
   }
   gs.played.add(next.url);
   if (gs.played.size > 120) gs.played.delete(gs.played.values().next().value);
+  gs.lastActivity = Date.now();
   setVoiceStatus(gs, trackStatus(next));
   updatePresence(next);
   saveQueues();
   const cached = next.file && existsSync(next.file) ? next.file : cacheLookup(next.url);
   if (cached) next.file = cached;
   startPlayback(gs, next, cached ? "cache" : "info");
-  gs.textChannel?.send({ embeds: [nowPlayingEmbed(next)], components: controls() }).catch(() => {});
+  sendNowPlaying(gs, next);
+  if (gs.radio && gs.queue.length === 0) radioFill(gs, false);
+}
+
+const videoIdOf = (url) =>
+  url?.match(/[?&]v=([\w-]{11})/)?.[1] ?? url?.match(/youtu\.be\/([\w-]{11})/)?.[1] ?? null;
+
+function radioSeed(gs) {
+  const url = [gs.current?.url, ...[...gs.played].reverse()].filter(Boolean).find(videoIdOf);
+  return url ? { url } : null;
+}
+
+async function radioFill(gs, playNow) {
+  if (!gs.radio || gs.radioFilling || gs.dead) return;
+  const seed = radioSeed(gs);
+  if (!seed) return;
+  gs.radioFilling = true;
+  try {
+    const id = videoIdOf(seed.url);
+    const mix = parseCandidates(
+      await runYtdlp(["-i", "--flat-playlist", "--playlist-end", String(RADIO_MIX_SIZE), ...PRINT_FLAT, `https://www.youtube.com/watch?v=${id}&list=RD${id}`]),
+    );
+    const pick = mix.find((c) => {
+      const t = norm(c.title ?? "");
+      if (!c.url || gs.played.has(c.url) || gs.queue.some((q) => q.url === c.url)) return false;
+      if ([...gs.vetoed].some((v) => t.includes(v))) return false;
+      return !REMIX_WORDS.some((w) => t.includes(w));
+    });
+    if (!pick) {
+      console.log("[radio] nenhuma sugestão nova no mix");
+      return;
+    }
+    console.log(`[radio] sugestão: ${pick.title}`);
+    const track = {
+      title: pick.title,
+      url: pick.url,
+      source: "youtube",
+      thumb: pick.thumbnail,
+      duration: pick.duration,
+      by: "Rádio",
+      radio: true,
+      seq: ++gs.seqCounter,
+    };
+    gs.queue.push(track);
+    prefetch(track, "radio");
+    saveQueues();
+    if (playNow && !gs.current) playNext(gs);
+  } catch (e) {
+    console.log(`[radio] falhou: ${shortErr(e)}`);
+  } finally {
+    gs.radioFilling = false;
+  }
 }
 
 const GOLD = 0xd4a017;
@@ -605,16 +637,16 @@ const fmtDur = (s) =>
 
 function nowPlayingEmbed(track) {
   const fields = [
-    { name: "Pedido por", value: track.by, inline: true },
+    { name: track.radio ? "Sugestão do rádio" : "Pedido por", value: track.by, inline: true },
     { name: "Fonte", value: SOURCE_NAMES[track.source] ?? "—", inline: true },
   ];
   const dur = fmtDur(track.duration);
   if (dur) fields.push({ name: "Duração", value: dur, inline: true });
   return {
-    author: { name: "Tocando agora" },
+    author: { name: track.radio ? "Tocando agora · Rádio" : "Tocando agora" },
     title: track.title,
     url: track.url,
-    color: GOLD,
+    color: track.radio ? 0x5865f2 : GOLD,
     thumbnail: track.thumb ? { url: track.thumb } : undefined,
     fields,
     footer: { text: "Campeão" },
@@ -627,35 +659,65 @@ const helpEmbed = () => ({
     '**Por voz** (comigo no canal): *"Campeão, toca <música>"* — e também: pula, pausa, continua, para, rádio, letra, sai.',
     'Com música tocando, diga só *"Campeão"*: o som abaixa e eu escuto por 2s.',
     '**Fonte específica**: *"…no YouTube"* ou *"…no SoundCloud"*. Sem indicar, o Deezer identifica a faixa oficial.',
-    "**Slash**: `/tocar` sugere músicas enquanto você digita — e tem `/fila` `/radio` `/letra` `/pular` `/parar` `/sair`.",
+    "**Slash**: `/tocar` sugere músicas enquanto você digita — e tem `/fila` `/radio` `/letra` `/vetar` `/pular` `/parar` `/sair`.",
     "**Por texto**: `!entra` `!play` `!pula` `!pausa` `!continua` `!para` `!fila` `!radio` `!letra` `!sai`",
-    "**Modo rádio**: quando a fila acaba, eu sigo sozinho com faixas parecidas.",
+    '**Rádio**: *"Campeão, liga o rádio"* — quando a fila acaba, sigo tocando parecidas. *"Campeão, essa não"* veta a atual.',
+    "Saio sozinho após 5 min sem música e sem comando, ou 1 min com o canal vazio.",
   ].join("\n"),
   color: GOLD,
   footer: { text: "Campeão" },
 });
 
-const controls = () => [
-  {
-    type: 1,
-    components: [
-      { type: 2, style: 2, custom_id: "cp:toggle", label: "Pausar / Continuar" },
-      { type: 2, style: 2, custom_id: "cp:skip", label: "Pular" },
-      { type: 2, style: 2, custom_id: "cp:queue", label: "Fila" },
-      { type: 2, style: 2, custom_id: "cp:lyrics", label: "Letra" },
-      { type: 2, style: 4, custom_id: "cp:stop", label: "Parar" },
-    ],
-  },
-];
+const BTN = { PRIMARY: 1, SECONDARY: 2, DANGER: 4 };
 
-function queueEmbed(gs) {
+function controlRows(gs) {
+  const paused = gs.player?.state?.status === AudioPlayerStatus.Paused;
+  return [
+    {
+      type: 1,
+      components: [
+        { type: 2, style: BTN.SECONDARY, custom_id: "cmp:pause", label: paused ? "Retomar" : "Pausar" },
+        { type: 2, style: BTN.SECONDARY, custom_id: "cmp:skip", label: "Pular" },
+        { type: 2, style: BTN.SECONDARY, custom_id: "cmp:veto", label: "Não curti" },
+        { type: 2, style: BTN.DANGER, custom_id: "cmp:stop", label: "Parar" },
+      ],
+    },
+    {
+      type: 1,
+      components: [
+        { type: 2, style: gs.radio ? BTN.PRIMARY : BTN.SECONDARY, custom_id: "cmp:radio", label: gs.radio ? "Rádio ligado" : "Ligar rádio" },
+        { type: 2, style: BTN.SECONDARY, custom_id: "cmp:queue", label: "Ver fila" },
+        { type: 2, style: BTN.SECONDARY, custom_id: "cmp:lyrics", label: "Letra" },
+      ],
+    },
+  ];
+}
+
+async function sendNowPlaying(gs, track) {
+  const previous = gs.nowPlayingMessage;
+  gs.nowPlayingMessage = null;
+  if (previous) previous.edit({ components: [] }).catch(() => {});
+  try {
+    gs.nowPlayingMessage = await gs.textChannel?.send({ embeds: [nowPlayingEmbed(track)], components: controlRows(gs) });
+  } catch (e) {
+    console.log("[discord] falha ao enviar card:", e.message);
+  }
+}
+
+function refreshControls(gs) {
+  gs.nowPlayingMessage?.edit({ components: controlRows(gs) }).catch(() => {});
+}
+
+function queueText(gs) {
   const lines = [
     gs.current ? `**Agora** · [${gs.current.title}](${gs.current.url})` : "Nada tocando.",
-    ...gs.queue.map((t, i) => `**${i + 1}** · ${t.title}`),
+    ...gs.queue.map((t, i) => `**${i + 1}** · ${t.title}${t.radio ? " · rádio" : ""}`),
   ];
   if (gs.radio) lines.push("-# modo rádio ligado");
-  return { author: { name: "Fila" }, description: lines.join("\n").slice(0, 3900), color: GRAY };
+  return lines.join("\n").slice(0, 1900);
 }
+
+const queueEmbed = (gs) => ({ author: { name: "Fila" }, description: queueText(gs), color: GRAY });
 
 async function fetchLyrics(track) {
   const q = norm(track.title)
@@ -664,7 +726,7 @@ async function fetchLyrics(track) {
     .trim();
   try {
     const res = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`, {
-      headers: { "user-agent": "campeao-bot (github.com/guilhermebsantiago/campeao-bot)" },
+      headers: { "user-agent": "campeao-bot (github.com/VitorPiovezan/campeao-bot)" },
       signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) return null;
@@ -731,6 +793,7 @@ const serializeTrack = (t) => ({
   thumb: t.thumb ?? null,
   duration: t.duration ?? null,
   by: t.by,
+  radio: Boolean(t.radio),
   seq: t.seq ?? 0,
 });
 
@@ -832,18 +895,8 @@ async function enqueue(gs, rawQuery, by) {
   }
 }
 
-function toggleRadio(gs, who) {
-  gs.radio = !gs.radio;
-  saveQueues();
-  gs.textChannel
-    ?.send(`-# Modo rádio **${gs.radio ? "ligado" : "desligado"}** por ${who}`)
-    .catch(() => {});
-  if (gs.radio && !gs.current && !gs.queue.length) fillRadio(gs);
-}
-
 function stopAll(gs) {
   for (const t of [gs.current, ...gs.queue]) dropTrackFile(t);
-  gs.radio = false;
   gs.queue = [];
   gs.current = null;
   gs.currentResource = null;
@@ -853,13 +906,68 @@ function stopAll(gs) {
   clearVoiceStatus(gs);
   updatePresence(null);
   saveQueues();
+  gs.nowPlayingMessage?.edit({ components: [] }).catch(() => {});
+  gs.nowPlayingMessage = null;
+}
+
+function setRadio(gs, on, by) {
+  gs.radio = on;
+  gs.lastActivity = Date.now();
+  saveQueues();
+  if (on) {
+    gs.textChannel?.send(`-# Rádio ligado por ${by} — quando a fila acabar eu sigo tocando parecidas`).catch(() => {});
+    if (!gs.current) radioFill(gs, true);
+    else if (gs.queue.length === 0) radioFill(gs, false);
+  } else {
+    gs.queue = gs.queue.filter((t) => !t.radio);
+    gs.textChannel?.send(`-# Rádio desligado por ${by}`).catch(() => {});
+  }
+}
+
+function vetoCurrent(gs, by) {
+  const cur = gs.current;
+  if (!cur) return;
+  const key = norm(cur.title).split(" ").slice(0, 3).join(" ");
+  if (key) gs.vetoed.add(key);
+  gs.textChannel?.send(`-# ${by} vetou **${cur.title}** — não repito nesta sessão`).catch(() => {});
+  playNext(gs);
+}
+
+function humansIn(channelId) {
+  const ch = channelId ? client.channels.cache.get(channelId) : null;
+  if (!ch?.members) return 1;
+  return ch.members.filter((m) => !m.user.bot).size;
+}
+
+function checkIdle(gs) {
+  if (gs.dead) return;
+  const alone = humansIn(gs.voiceChannelId) === 0;
+  if (alone) {
+    gs.emptySince ??= Date.now();
+    if (Date.now() - gs.emptySince > EMPTY_MS) {
+      gs.textChannel?.send("-# Canal vazio, saindo").catch(() => {});
+      console.log("[idle] canal vazio, saindo");
+      leave(gs);
+    }
+    return;
+  }
+  gs.emptySince = null;
+  const idle = !gs.current && Date.now() - gs.lastActivity > IDLE_MS;
+  if (idle) {
+    const mins = Math.round(IDLE_MS / 60000);
+    gs.textChannel?.send(`-# ${mins} minutos sem música e sem comando, vou nessa. Chame com \`!entra\``).catch(() => {});
+    console.log(`[idle] ocioso ${mins}min, saindo`);
+    leave(gs);
+  }
 }
 
 function teardown(gs) {
+  if (gs.idleTimer) clearInterval(gs.idleTimer);
+  gs.idleTimer = null;
+  gs.nowPlayingMessage?.edit({ components: [] }).catch(() => {});
+  gs.nowPlayingMessage = null;
   if (guilds.get(gs.guildId) === gs) guilds.delete(gs.guildId);
   gs.dead = true;
-  if (gs.emptyTimer) clearTimeout(gs.emptyTimer);
-  gs.emptyTimer = null;
   clearVoiceStatus(gs);
   updatePresence(null);
   saveQueues();
@@ -930,10 +1038,18 @@ function wavFrom(pcm) {
   return Buffer.concat([h, pcm]);
 }
 
+const groqHits = [];
+function groqSlotFree() {
+  const cutoff = Date.now() - 60000;
+  while (groqHits.length && groqHits[0] < cutoff) groqHits.shift();
+  return groqHits.length < GROQ_RPM;
+}
+
 async function groqTranscribe(pcm) {
+  groqHits.push(Date.now());
   const fd = new FormData();
   fd.append("file", new Blob([wavFrom(pcm)], { type: "audio/wav" }), "audio.wav");
-  fd.append("model", "whisper-large-v3-turbo");
+  fd.append("model", GROQ_MODEL);
   fd.append("language", "pt");
   fd.append("prompt", STT_PROMPT);
   const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
@@ -977,7 +1093,12 @@ async function transcribe(pcm, priority = false) {
   }
   sttPending++;
   try {
-    return GROQ_KEY ? await groqTranscribe(pcm) : await localTranscribe(pcm);
+    if (!GROQ_KEY) return await localTranscribe(pcm);
+    if (!groqSlotFree()) {
+      console.log("[stt] cota da groq no limite, usando whisper local");
+      return await localTranscribe(pcm);
+    }
+    return await groqTranscribe(pcm);
   } catch (e) {
     console.log("[stt] erro:", e.message);
     return null;
@@ -985,6 +1106,66 @@ async function transcribe(pcm, priority = false) {
     sttPending--;
   }
 }
+
+const GATE_SECONDS = envNum("GATE_SECONDS", 2.5);
+const GATE_MAX_CONCURRENT = envNum("GATE_MAX_CONCURRENT", 2);
+const GATE_OFF = envFlag("GATE_DISABLED");
+let gatePending = 0;
+const gateStats = { pass: 0, block: 0, busy: 0 };
+
+const GATE_STOP = new Set([
+  "campo", "campos", "campanha", "compra", "comprar", "comprei", "compras", "compro",
+  "compilei", "compilar", "compila", "computador", "companhia", "comparar", "compara",
+  "completo", "completa", "completou", "complicado", "compromisso", "competir",
+  "competencia", "comportamento", "comprido", "compreendi", "compreender", "compensa",
+  "componente", "composto", "comprovar", "campeonato",
+]);
+
+function gateHasWake(text) {
+  const t = norm(text ?? "");
+  if (!t) return false;
+  return t.split(" ").some((w) => {
+    if (GATE_STOP.has(w)) return false;
+    if (/peao|piao/.test(w)) return true;
+    if (/^(c[ao]mp|kamp)/.test(w)) return true;
+    return w.length >= 5 && editDistance(w, "campeao") <= 3;
+  });
+}
+
+async function gateWake(pcm16, who) {
+  if (gatePending >= GATE_MAX_CONCURRENT) {
+    gateStats.busy++;
+    return false;
+  }
+  gatePending++;
+  try {
+    const head = pcm16.subarray(0, Math.min(pcm16.length, Math.round(16000 * 2 * GATE_SECONDS)));
+    const text = await localTranscribe(head);
+    const ok = gateHasWake(text);
+    if (ok) {
+      gateStats.pass++;
+      console.log(`[gate] ${who}: passou ("${(text ?? "").trim().slice(0, 40)}")`);
+    } else {
+      gateStats.block++;
+    }
+    return ok;
+  } catch (e) {
+    console.log("[gate] erro, deixando passar:", e.message);
+    return true;
+  } finally {
+    gatePending--;
+  }
+}
+
+setInterval(() => {
+  const { pass, block, busy } = gateStats;
+  if (pass + block + busy > 0) {
+    console.log(`[gate] 5min: ${pass} p/ groq, ${block} barradas, ${busy} descartadas (economia ${Math.round((100 * (block + busy)) / (pass + block + busy))}%)`);
+    gateStats.pass = 0;
+    gateStats.block = 0;
+    gateStats.busy = 0;
+  }
+}, 5 * 60 * 1000);
 
 function captureUtterance(gs, userId) {
   if (gs.dead || guilds.get(gs.guildId) !== gs) return;
@@ -1002,7 +1183,7 @@ function captureUtterance(gs, userId) {
   opus.pipe(decoder);
   decoder.on("data", (c) => {
     bytes += c.length;
-    if (bytes < 48000 * 2 * 2 * 15) chunks.push(c);
+    if (bytes < 48000 * 2 * 2 * (MAX_UTTERANCE_S + 3)) chunks.push(c);
   });
   const cleanup = (e) => {
     if (e) console.log("[voz] erro no stream:", e.message);
@@ -1017,9 +1198,9 @@ function captureUtterance(gs, userId) {
       console.log(`[voz] descartando ${secs.toFixed(1)}s (acima do limite de ${MAX_UTTERANCE_S}s)`);
       return;
     }
-    const mono = to16kMono(pcm);
+    const pcm16 = to16kMono(pcm);
     if (secs > 6) {
-      const ratio = silenceRatio(mono);
+      const ratio = silenceRatio(pcm16);
       if (ratio < MUSIC_SILENCE_RATIO) {
         console.log(`[voz] descartando ${secs.toFixed(1)}s (pausas ${(ratio * 100).toFixed(0)}%, provável música)`);
         return;
@@ -1027,7 +1208,8 @@ function captureUtterance(gs, userId) {
     }
     const attentive = (gs.attention.get(userId) ?? 0) > startedAt;
     if (attentive) playBeep(gs);
-    const text = await transcribe(mono, attentive);
+    if (!attentive && GROQ_KEY && !GATE_OFF && !(await gateWake(pcm16, user?.username ?? userId))) return;
+    const text = await transcribe(pcm16, attentive);
     console.log(`[stt] ${user?.username ?? userId}: "${text}"`);
     if (text) handleVoice(gs, userId, text, startedAt);
   });
@@ -1058,6 +1240,7 @@ function handleVoice(gs, userId, raw, startedAt) {
     return;
   }
   gs.attention.delete(userId);
+  gs.lastActivity = Date.now();
   console.log(`[wake] comando: "${rest}"`);
   const mention = `<@${userId}>`;
 
@@ -1067,10 +1250,25 @@ function handleVoice(gs, userId, raw, startedAt) {
     return;
   }
 
-
   const restWords = rest.split(" ").filter((w) => !["ai", "ei", "vai", "ow", "o"].includes(w));
   const head = restWords[0] ?? "";
   const tail = restWords.slice(1).join(" ");
+  const mentionsRadio = restWords.length <= 2 && restWords.some((w) => matchVerb(w, ["radio"]));
+
+  if (mentionsRadio) {
+    const off = ["para", "parar", "desliga", "desligar", "tira", "encerra", "cancela"].some((v) => matchVerb(head, [v]));
+    setRadio(gs, !off, mention);
+    refreshControls(gs);
+    return;
+  }
+  if (/^(essa|esta|essa nao|nao gostei|tira essa|veta|odeio)/.test(rest) && /(nao|gostei|tira|veta|odeio)/.test(rest)) {
+    vetoCurrent(gs, mention);
+    return;
+  }
+  if (/^letra/.test(head)) {
+    lyricsEmbed(gs).then((e) => gs.textChannel?.send({ embeds: [e] }).catch(() => {}));
+    return;
+  }
 
   if (matchVerb(head, PLAY_VERBS)) {
     const query = tail
@@ -1092,25 +1290,19 @@ function handleVoice(gs, userId, raw, startedAt) {
   if (matchVerb(head, PAUSE_VERBS)) {
     gs.player.pause();
     gs.textChannel?.send(`-# Pausada por ${mention}`).catch(() => {});
+    refreshControls(gs);
     return;
   }
   if (matchVerb(head, RESUME_VERBS)) {
     unduck(gs);
     gs.player.unpause();
     gs.textChannel?.send(`-# Retomada por ${mention}`).catch(() => {});
+    refreshControls(gs);
     return;
   }
   if (matchVerb(head, STOP_VERBS) || /^cala/.test(head)) {
     stopAll(gs);
     gs.textChannel?.send(`-# Parada por ${mention} — fila limpa`).catch(() => {});
-    return;
-  }
-  if (/^(radio|hadio|radiu)$/.test(head) || /^(radio|hadio)\b/.test(rest)) {
-    toggleRadio(gs, mention);
-    return;
-  }
-  if (/^letra/.test(head)) {
-    lyricsEmbed(gs).then((e) => gs.textChannel?.send({ embeds: [e] }).catch(() => {}));
     return;
   }
   if (LEAVE_VERBS.includes(head)) {
@@ -1122,11 +1314,6 @@ function handleVoice(gs, userId, raw, startedAt) {
     gs.textChannel?.send(`-# Entendi “${rest}” — comando desconhecido`).catch(() => {});
   }
   console.log(`[wake] não entendi: "${rest}"`);
-}
-
-function humansIn(channelId) {
-  const ch = channelId ? client.channels.cache.get(channelId) : null;
-  return ch?.members ? ch.members.filter((m) => !m.user.bot).size : 0;
 }
 
 function moveTo(gs, voice) {
@@ -1165,6 +1352,7 @@ function joinFor(member, channel) {
 
 function connect(guild, voice, channel) {
   const gs = getState(guild.id);
+  gs.guild = guild;
   if (channel) gs.textChannel = channel;
   if (gs.connection) return gs;
   const zombie = getVoiceConnection(guild.id);
@@ -1220,6 +1408,8 @@ function connect(guild, voice, channel) {
     playNext(gs);
   });
   gs.connection.receiver.speaking.on("start", (userId) => captureUtterance(gs, userId));
+  gs.lastActivity = Date.now();
+  gs.idleTimer = setInterval(() => checkIdle(gs), 30000);
   console.log(`[voz] entrei em "${voice.name}" (${guild.name})`);
   return gs;
 }
@@ -1276,42 +1466,31 @@ client.on(Events.MessageCreate, async (m) => {
   const gs = guilds.get(m.guild.id);
   if (!gs) return;
   gs.textChannel = m.channel;
+  gs.lastActivity = Date.now();
 
-  if (["pula", "skip", "proxima"].includes(command)) playNext(gs);
+  if (command === "radio") {
+    setRadio(gs, !gs.radio, `${m.author}`);
+    refreshControls(gs);
+  } else if (["pula", "skip", "proxima"].includes(command)) playNext(gs);
   else if (["para", "stop"].includes(command)) stopAll(gs);
-  else if (command === "pausa") gs.player.pause();
-  else if (["continua", "resume"].includes(command)) gs.player.unpause();
-  else if (command === "fila") m.reply({ embeds: [queueEmbed(gs)] }).catch(() => {});
-  else if (command === "radio") toggleRadio(gs, `${m.author}`);
+  else if (command === "pausa") {
+    gs.player.pause();
+    refreshControls(gs);
+  } else if (["continua", "resume"].includes(command)) {
+    gs.player.unpause();
+    refreshControls(gs);
+  } else if (command === "fila") m.reply({ embeds: [queueEmbed(gs)] }).catch(() => {});
   else if (command === "letra") {
     lyricsEmbed(gs).then((e) => m.reply({ embeds: [e] }).catch(() => {}));
-  } else if (["sai", "sair"].includes(command)) leave(gs);
+  } else if (["veta", "vetar"].includes(command)) vetoCurrent(gs, `${m.author}`);
+  else if (["sai", "sair"].includes(command)) leave(gs);
   else if (command === "ajuda") m.reply({ embeds: [helpEmbed()] }).catch(() => {});
 });
 
 client.on(Events.VoiceStateUpdate, (oldS, newS) => {
   const gs = guilds.get((newS.guild ?? oldS.guild).id);
   if (!gs || gs.dead) return;
-  if (newS.id === client.user.id) {
-    if (!newS.channelId) return;
-    gs.voiceChannelId = newS.channelId;
-  }
-  if (!gs.voiceChannelId) return;
-  if (humansIn(gs.voiceChannelId) > 0) {
-    if (gs.emptyTimer) {
-      clearTimeout(gs.emptyTimer);
-      gs.emptyTimer = null;
-    }
-    return;
-  }
-  if (gs.emptyTimer) return;
-  console.log("[voz] canal vazio, saindo em 60s");
-  gs.emptyTimer = setTimeout(() => {
-    gs.emptyTimer = null;
-    if (gs.dead || humansIn(gs.voiceChannelId) > 0) return;
-    gs.textChannel?.send("-# Canal vazio — saindo.").catch(() => {});
-    leave(gs);
-  }, EMPTY_LEAVE_MS);
+  if (newS.id === client.user.id && newS.channelId) gs.voiceChannelId = newS.channelId;
 });
 
 const SLASH = [
@@ -1328,6 +1507,7 @@ const SLASH = [
   { name: "parar", description: "Para tudo e limpa a fila" },
   { name: "fila", description: "Mostra a fila" },
   { name: "radio", description: "Liga/desliga o modo rádio" },
+  { name: "vetar", description: "Veta a música atual pelo resto da sessão" },
   { name: "letra", description: "Mostra a letra da música atual" },
   { name: "sair", description: "Faz o Campeão sair do canal" },
   { name: "ajuda", description: "Como usar o Campeão" },
@@ -1384,6 +1564,7 @@ async function handleSlash(i) {
     return;
   }
   gs.textChannel = i.channel;
+  gs.lastActivity = Date.now();
   if (name === "fila") {
     await i.reply({ embeds: [queueEmbed(gs)] }).catch(() => {});
     return;
@@ -1394,14 +1575,24 @@ async function handleSlash(i) {
     return;
   }
   if (name === "radio") {
-    toggleRadio(gs, `${i.user}`);
+    setRadio(gs, !gs.radio, `${i.user}`);
+    refreshControls(gs);
     await i.reply({ content: `-# Modo rádio **${gs.radio ? "ligado" : "desligado"}**`, flags: MessageFlags.Ephemeral }).catch(() => {});
+    return;
+  }
+  if (name === "vetar") {
+    if (!gs.current) {
+      await i.reply({ content: "-# Nada tocando", flags: MessageFlags.Ephemeral }).catch(() => {});
+      return;
+    }
+    await i.reply(`-# Vetada por ${i.user}`).catch(() => {});
+    vetoCurrent(gs, `${i.user}`);
     return;
   }
   const actions = {
     pular: () => { playNext(gs); return "Pulada"; },
-    pausar: () => { gs.player.pause(); return "Pausada"; },
-    continuar: () => { unduck(gs); gs.player.unpause(); return "Retomada"; },
+    pausar: () => { gs.player.pause(); refreshControls(gs); return "Pausada"; },
+    continuar: () => { unduck(gs); gs.player.unpause(); refreshControls(gs); return "Retomada"; },
     parar: () => { stopAll(gs); return "Parada — fila limpa"; },
     sair: () => { leave(gs); return "Saindo"; },
   };
@@ -1410,39 +1601,49 @@ async function handleSlash(i) {
 }
 
 async function handleButton(i) {
+  if (!i.customId.startsWith("cmp:")) return;
   const gs = i.guildId ? guilds.get(i.guildId) : null;
   if (!gs) {
-    await i.reply({ content: "-# Não estou tocando nada", flags: MessageFlags.Ephemeral }).catch(() => {});
+    await i.reply({ content: "-# Não estou mais tocando nada.", flags: MessageFlags.Ephemeral }).catch(() => {});
     return;
   }
-  gs.textChannel = i.channel;
-  switch (i.customId) {
-    case "cp:toggle": {
-      const paused = gs.player.state.status === AudioPlayerStatus.Paused;
-      if (paused) {
-        unduck(gs);
-        gs.player.unpause();
-      } else {
-        gs.player.pause();
-      }
-      await i.reply(`-# ${paused ? "Retomada" : "Pausada"} por ${i.user}`).catch(() => {});
-      return;
+  const action = i.customId.slice(4);
+  gs.lastActivity = Date.now();
+  const who = `<@${i.user.id}>`;
+
+  if (action === "queue") {
+    await i.reply({ embeds: [queueEmbed(gs)], flags: MessageFlags.Ephemeral }).catch(() => {});
+    return;
+  }
+  if (action === "lyrics") {
+    await i.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+    await i.editReply({ embeds: [await lyricsEmbed(gs)] }).catch(() => {});
+    return;
+  }
+  await i.deferUpdate().catch(() => {});
+
+  if (action === "pause") {
+    const paused = gs.player.state.status === AudioPlayerStatus.Paused;
+    if (paused) {
+      unduck(gs);
+      gs.player.unpause();
+      gs.textChannel?.send(`-# Retomada por ${who}`).catch(() => {});
+    } else {
+      gs.player.pause();
+      gs.textChannel?.send(`-# Pausada por ${who}`).catch(() => {});
     }
-    case "cp:skip":
-      playNext(gs);
-      await i.reply(`-# Pulada por ${i.user}`).catch(() => {});
-      return;
-    case "cp:stop":
-      stopAll(gs);
-      await i.reply(`-# Parada por ${i.user} — fila limpa`).catch(() => {});
-      return;
-    case "cp:queue":
-      await i.reply({ embeds: [queueEmbed(gs)], flags: MessageFlags.Ephemeral }).catch(() => {});
-      return;
-    case "cp:lyrics":
-      await i.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
-      await i.editReply({ embeds: [await lyricsEmbed(gs)] }).catch(() => {});
-      return;
+    refreshControls(gs);
+  } else if (action === "skip") {
+    gs.textChannel?.send(`-# Pulada por ${who}`).catch(() => {});
+    playNext(gs);
+  } else if (action === "veto") {
+    vetoCurrent(gs, who);
+  } else if (action === "stop") {
+    stopAll(gs);
+    gs.textChannel?.send(`-# Parada por ${who} — fila limpa`).catch(() => {});
+  } else if (action === "radio") {
+    setRadio(gs, !gs.radio, who);
+    refreshControls(gs);
   }
 }
 
@@ -1470,7 +1671,7 @@ client.once(Events.ClientReady, async () => {
 async function warmupYoutube() {
   try {
     const t0 = Date.now();
-    const raw = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", "https://www.youtube.com/watch?v=SRXH9AbT280"], { timeout: 90000 });
+    const raw = await runYtdlp(["--no-playlist", "-f", "bestaudio/best", "-J", `https://www.youtube.com/watch?v=${WARMUP_VIDEO_ID}`], { timeout: 90000 });
     const info = JSON.parse(raw.trim().split("\n").filter(Boolean)[0]);
     const file = `${INFO_DIR}/warmup.info.json`;
     writeFileSync(file, JSON.stringify(info));
@@ -1488,13 +1689,14 @@ async function warmupYoutube() {
   }
 }
 setTimeout(warmupYoutube, 8000);
-setInterval(warmupYoutube, 4 * 60 * 60 * 1000);
+setInterval(warmupYoutube, WARMUP_INTERVAL_MS);
 
 try {
   ensureBeep();
 } catch (e) {
   console.error("Falha ao gerar bip (seguindo sem):", e.message);
 }
+
 function flushAndExit() {
   if (saveTimer) {
     clearTimeout(saveTimer);
